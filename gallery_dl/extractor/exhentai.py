@@ -12,6 +12,7 @@ from .common import Extractor, Message
 from .. import text, util, exception
 from ..cache import cache
 import itertools
+import json
 import random
 import time
 import math
@@ -295,8 +296,6 @@ class ExhentaiGalleryExtractor(ExhentaiExtractor):
             raise exception.AuthorizationError()
         if page.startswith(("Key missing", "Gallery not found")):
             raise exception.NotFoundError("gallery")
-        if "hentai.org/mpv/" in page:
-            self.log.warning("Enabled Multi-Page Viewer is not supported")
         return page
 
     def _image_page(self):
@@ -405,6 +404,59 @@ class ExhentaiSearchExtractor(ExhentaiExtractor):
             self.params["page"] += 1
             self.wait()
 
+class ExhentaiMpvGalleryExtractor(ExhentaiGalleryExtractor):
+    """Extractor for image galleries from exhentai.org using the multi-page viewer (MPV)"""
+    subcategory = "mpv-gallery"
+    pattern = (BASE_PATTERN +
+               r"(/mpv/(\d+)/([\da-f]{10}))")
+    test = ("https://e-hentai.org/mpv/530350/8b3c7e4a21/", {"count": 69})
+
+    def __init__(self, match):
+        ExhentaiExtractor.__init__(self, match)
+        self.gallery_id = text.parse_int(match.group(3))
+        self.gallery_token = match.group(4)
+
+    def _mpv_page(self):
+        url = "{}/mpv/{}/{}".format(
+            self.root, self.gallery_id, self.gallery_token)
+        page = self.request(url, fatal=False).text
+
+        if page.startswith(("Invalid page", "Keep trying", "Key missing")):
+            raise exception.NotFoundError("mpv page")
+        return page
+
+    def parse_embedded_keys(self, page):
+        self.imagelist = json.loads((text.extract(page, 'var imagelist = ', ';')[0]))
+        self.image_num = text.extract(page, 'var pagecount = ', ';')[0]
+        self.mpv_key = text.extract(page, 'var mpvkey = "', '";')[0]
+
+    def images_from_api(self):
+        api_url = self.root + "/api.php"
+        request = {
+            "method": "imagedispatch",
+            "gid": self.gallery_id,
+            "mpvkey": self.mpv_key,
+        }
+
+        for i, img in enumerate(self.imagelist, start=1):
+            req = {"page": i, "imgkey": img["k"], **request}
+            page = self.request(api_url, method="POST", json=req).json()
+            meta = text.nameext_from_url(page["i"])
+            meta["num"] = i
+            yield page["i"], meta
+
+    def items(self):
+        self.login()
+        mpv_page = self._mpv_page()
+        self.parse_embedded_keys(mpv_page)
+        data = self.get_metadata(self._gallery_page())
+
+        yield Message.Version, 1
+        yield Message.Directory, data
+
+        for img, meta in self.images_from_api():
+            meta.update(data)
+            yield Message.Url, img, meta
 
 class ExhentaiFavoriteExtractor(ExhentaiSearchExtractor):
     """Extractor for favorited exhentai galleries"""
